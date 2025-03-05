@@ -27,6 +27,17 @@ print_info() {
     echo "$label: $value" >> "$REPORT_FILE"
 }
 
+# Ensure script is run as root
+if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}Please run as root${NC}"
+    exit 1
+fi
+
+# Function to check command existence
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
 # Start the audit
 echo -e "${BLUE}${BOLD}VPS Security Audit Tool${NC}"
 echo -e "${GRAY}https://github.com/vernu/vps-audit${NC}"
@@ -46,12 +57,12 @@ KERNEL_VERSION=$(uname -r)
 HOSTNAME=$HOSTNAME
 UPTIME=$(uptime -p)
 UPTIME_SINCE=$(uptime -s)
-CPU_INFO=$(lscpu | grep "Model name" | cut -d':' -f2 | xargs)
-CPU_CORES=$(nproc)
-TOTAL_MEM=$(free -h | awk '/^Mem:/ {print $2}')
-TOTAL_DISK=$(df -h / | awk 'NR==2 {print $2}')
-PUBLIC_IP=$(curl -s https://api.ipify.org)
-LOAD_AVERAGE=$(uptime | awk -F'load average:' '{print $2}' | xargs)
+
+read -r -d ":" CPU_CORES CPU_INFO <<< "$(grep "^model name" /proc/cpuinfo | uniq -c | sed -r -e 's/^ +//' -e 's/ model name\t: +/:/')"
+read -r -d " " TOTAL_MEM USED_MEM FREE_MEM <<< "$(free -h | awk '/^Mem:/ {print $2" "$3" "$7}')"
+read -r -d " " TOTAL_DISK USED_DISK FREE_DISK <<< "$(df -h / | awk 'NR==2 {print $2" "$3" "$4}')"
+read -r -d " " PUBLIC_IFACE PUBLIC_IP <<< "$(ip route get 1 | grep -o "dev.*" | awk '{print $2" "$4}')"
+read -r -d " " LOAD_AVG1 LOAD_AVG5 LOAD_AVG15 <<< "$(cat /proc/loadavg)"
 
 # Print system information
 print_info "Hostname" "$HOSTNAME"
@@ -60,10 +71,10 @@ print_info "Kernel Version" "$KERNEL_VERSION"
 print_info "Uptime" "$UPTIME (since $UPTIME_SINCE)"
 print_info "CPU Model" "$CPU_INFO"
 print_info "CPU Cores" "$CPU_CORES"
-print_info "Total Memory" "$TOTAL_MEM"
-print_info "Total Disk Space" "$TOTAL_DISK"
-print_info "Public IP" "$PUBLIC_IP"
-print_info "Load Average" "$LOAD_AVERAGE"
+print_info "Memory" Total: "$TOTAL_MEM" Used: "$USED_MEM" Free: "$FREE_MEM"
+print_info "Disk Space" "Total: $TOTAL_DISK, Used: $USED_DISK, Free: $FREE_DISK"
+print_info "Public IP" "$PUBLIC_IP"/"$PUBLIC_IFACE"
+print_info "Load Average" "$LOAD_AVG1" "$LOAD_AVG5" "$LOAD_AVG15"
 
 echo "" >> "$REPORT_FILE"
 
@@ -109,18 +120,31 @@ else
     check_security "System Restart" "PASS" "No restart required"
 fi
 
-# Check SSH config overrides
-SSH_CONFIG_OVERRIDES=$(grep "^Include" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}')
+while IFS= read -r line; do
+    if [[ "$line" =~ ^ *Include ]]; then
+        INCLUDE=$(echo $line | awk '{print $2}')
+        SSHD_CONFIG="$SSHD_CONFIG### Included from $INCLUDE\n"
+        if [ -f "$INCLUDE" ]; then
+            while IFS= read -r iline; do
+                SSHD_CONFIG="$SSHD_CONFIG$iline\n"
+            done <<< "$(grep -v -e "^ *#" -e "^$" "$INCLUDE")"
+        elif [ -d "$INCLUDE" ]; then
+            while IFS= read -r iline; do
+                SSHD_CONFIG="$SSHD_CONFIG$iline\n"
+            done <<< "$(grep -v -e "^ *#" -e "^$" "$INCLUDE/*")"
+        fi
+        SSHD_CONFIG="$SSHD_CONFIG### End include from $INCLUDE\n"
+    else
+        SSHD_CONFIG="$SSHD_CONFIG$line\n"
+    fi
+    done <<< "$(grep -v -e "^ *#" -e "^$" /etc/ssh/sshd_config)"
+# function to check on SSH configuration values
+sshd_config() {   
+    return $(grep "^ *$1" 2>/dev/null | head -1 | awk '{print $2}') <<< "$SSHD_CONFIG"
+}
 
 # Check SSH root login (handle both main config and overrides if they exist)
-if [ -n "$SSH_CONFIG_OVERRIDES" ] && [ -d "$(dirname "$SSH_CONFIG_OVERRIDES")" ]; then
-    SSH_ROOT=$(grep "^PermitRootLogin" $SSH_CONFIG_OVERRIDES /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}')
-else
-    SSH_ROOT=$(grep "^PermitRootLogin" /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}')
-fi
-if [ -z "$SSH_ROOT" ]; then
-    SSH_ROOT="prohibit-password"
-fi
+SSH_ROOT=$(sshd_config "PermitRootLogin")
 if [ "$SSH_ROOT" = "no" ]; then
     check_security "SSH Root Login" "PASS" "Root login is properly disabled in SSH configuration"
 else
@@ -128,14 +152,7 @@ else
 fi
 
 # Check SSH password authentication (handle both main config and overrides if they exist)
-if [ -n "$SSH_CONFIG_OVERRIDES" ] && [ -d "$(dirname "$SSH_CONFIG_OVERRIDES")" ]; then
-    SSH_PASSWORD=$(grep "^PasswordAuthentication" $SSH_CONFIG_OVERRIDES /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}')
-else
-    SSH_PASSWORD=$(grep "^PasswordAuthentication" /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}')
-fi
-if [ -z "$SSH_PASSWORD" ]; then
-    SSH_PASSWORD="yes"
-fi
+SSH_PASSWORD=$(sshd_config "PasswordAuthentication")
 if [ "$SSH_PASSWORD" = "no" ]; then
     check_security "SSH Password Auth" "PASS" "Password authentication is disabled, key-based auth only"
 else
@@ -145,12 +162,7 @@ fi
 
 # Check for default/unsecure SSH ports 
 UNPRIVILEGED_PORT_START=$(sysctl -n net.ipv4.ip_unprivileged_port_start)
-SSH_PORT=""
-if [ -n "$SSH_CONFIG_OVERRIDES" ] && [ -d "$(dirname "$SSH_CONFIG_OVERRIDES")" ]; then
-    SSH_PORT=$(grep "^Port" $SSH_CONFIG_OVERRIDES /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}')
-else
-    SSH_PORT=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | head -1 | awk '{print $2}')
-fi
+SSH_PORT=$(sshd_config "Port")
 if [ -z "$SSH_PORT" ]; then
     SSH_PORT="22"
 fi
@@ -165,25 +177,25 @@ fi
 
 # Check Firewall Status
 check_firewall_status() {
-    if command -v ufw >/dev/null 2>&1; then
+    if command_exists ufw; then
         if ufw status | grep -qw "active"; then
             check_security "Firewall Status (UFW)" "PASS" "UFW firewall is active and protecting your system"
         else
             check_security "Firewall Status (UFW)" "FAIL" "UFW firewall is not active - your system is exposed to network attacks"
         fi
-    elif command -v firewall-cmd >/dev/null 2>&1; then
+    elif command_exists firewall-cmd; then
         if firewall-cmd --state 2>/dev/null | grep -q "running"; then
             check_security "Firewall Status (firewalld)" "PASS" "Firewalld is active and protecting your system"
         else
             check_security "Firewall Status (firewalld)" "FAIL" "Firewalld is not active - your system is exposed to network attacks"
         fi
-    elif command -v iptables >/dev/null 2>&1; then
+    elif command_exists iptables; then
         if iptables -L -n | grep -q "Chain INPUT"; then
             check_security "Firewall Status (iptables)" "PASS" "iptables rules are active and protecting your system"
         else
             check_security "Firewall Status (iptables)" "FAIL" "No active iptables rules found - your system may be exposed"
         fi
-    elif command -v nft >/dev/null 2>&1; then
+    elif command_exists nft; then
         if nft list ruleset | grep -q "table"; then
             check_security "Firewall Status (nftables)" "PASS" "nftables rules are active and protecting your system"
         else
@@ -208,44 +220,24 @@ fi
 IPS_INSTALLED=0
 IPS_ACTIVE=0
 
-if dpkg -l | grep -q "fail2ban"; then
+
+dpkg -l fail2ban && {
     IPS_INSTALLED=1
     systemctl is-active fail2ban >/dev/null 2>&1 && IPS_ACTIVE=1
-fi
+}
 
-# Check docker container running fail2ban
-if command -v docker >/dev/null 2>&1; then
-    if systemctl is-active --quiet docker; then
-        if docker ps -a | awk '{print $2}' | grep "fail2ban" >/dev/null 2>&1; then
-            IPS_INSTALLED=1
-            docker ps | grep -q "fail2ban" && IPS_ACTIVE=1
-        fi
-    else
-        check_security "Intrusion Prevention" "WARN" "Docker is instaleld but not running - cannot check for Fail2ban containers"
-    fi
-fi
-
-if dpkg -l | grep -q "crowdsec"; then
+dpkg -l crowdsec && {
     IPS_INSTALLED=1
     systemctl is-active crowdsec >/dev/null 2>&1 && IPS_ACTIVE=1
-fi
+}
 
-# Check docker container running crowdsec
-if command -v docker >/dev/null 2>&1; then
-    if systemctl is-active --quiet docker; then
-        if docker ps -a | awk '{print $2}' | grep "crowdsec" >/dev/null 2>&1; then
-            IPS_INSTALLED=1
-            docker ps | grep -q "crowdsec" && IPS_ACTIVE=1
-        fi
-    else
-        check_security "Intrusion Prevention" "WARN" "Docker is instaleld but not running - cannot check for CrowdSec containers"
-    fi
-fi
+dpkg -l fail2ban >/dev/null || dpkg -l crowdsec >/dev/null || {
+    check_security "Intrusion Prevention" "FAIL" "No intrusion prevention system (Fail2ban or CrowdSec) is installed"
+}
 
 case "$IPS_INSTALLED$IPS_ACTIVE" in
     "11") check_security "Intrusion Prevention" "PASS" "Fail2ban or CrowdSec is installed and running" ;;
     "10") check_security "Intrusion Prevention" "WARN" "Fail2ban or CrowdSec is installed but not running" ;;
-    *)    check_security "Intrusion Prevention" "FAIL" "No intrusion prevention system (Fail2ban or CrowdSec) is installed" ;;
 esac
 
 # Check failed login attempts
@@ -276,7 +268,7 @@ UPDATES=$(apt-get -s upgrade 2>/dev/null | grep -P '^\d+ upgraded' | cut -d" " -
 if [ -z "$UPDATES" ]; then
     UPDATES=0
 fi
-if [ "$UPDATES" -eq 0 ]; then
+if [ "$UPDATES" -eq 0]; then
     check_security "System Updates" "PASS" "All system packages are up to date"
 else
     check_security "System Updates" "FAIL" "$UPDATES security updates available - system is vulnerable to known exploits"
@@ -325,33 +317,26 @@ format_for_report() {
 }
 
 # Check disk space usage
-DISK_TOTAL=$(df -h / | awk 'NR==2 {print $2}')
-DISK_USED=$(df -h / | awk 'NR==2 {print $3}')
-DISK_AVAIL=$(df -h / | awk 'NR==2 {print $4}')
-DISK_USAGE=$(df -h / | awk 'NR==2 {print int($5)}')
+DISK_USAGE=$((USED_DISK / TOTAL_DISK * 100))
 if [ "$DISK_USAGE" -lt 50 ]; then
-    check_security "Disk Usage" "PASS" "Healthy disk space available (${DISK_USAGE}% used - Used: ${DISK_USED} of ${DISK_TOTAL}, Available: ${DISK_AVAIL})"
+    check_security "Disk Usage" "PASS" "Healthy disk space available (${DISK_USAGE}% used - Used: ${USED_DISK} of ${TOTAL_DISK}, Available: ${FREE_DISK})"
 elif [ "$DISK_USAGE" -lt 80 ]; then
-    check_security "Disk Usage" "WARN" "Disk space usage is moderate (${DISK_USAGE}% used - Used: ${DISK_USED} of ${DISK_TOTAL}, Available: ${DISK_AVAIL})"
+    check_security "Disk Usage" "WARN" "Disk space usage is moderate (${DISK_USAGE}% used - Used: ${USED_DISK} of ${TOTAL_DISK}, Available: ${FREE_DISK})"
 else
-    check_security "Disk Usage" "FAIL" "Critical disk space usage (${DISK_USAGE}% used - Used: ${DISK_USED} of ${DISK_TOTAL}, Available: ${DISK_AVAIL})"
+    check_security "Disk Usage" "FAIL" "Critical disk space usage (${DISK_USAGE}% used - Used: ${USED_DISK} of ${TOTAL_DISK}, Available: ${FREE_DISK})"
 fi
 
 # Check memory usage
-MEM_TOTAL=$(free -h | awk '/^Mem:/ {print $2}')
-MEM_USED=$(free -h | awk '/^Mem:/ {print $3}')
-MEM_AVAIL=$(free -h | awk '/^Mem:/ {print $7}')
-MEM_USAGE=$(free | awk '/^Mem:/ {printf "%.0f", $3/$2 * 100}')
+MEM_USAGE=$((USED_MEM / TOTAL_MEM * 100))
 if [ "$MEM_USAGE" -lt 50 ]; then
-    check_security "Memory Usage" "PASS" "Healthy memory usage (${MEM_USAGE}% used - Used: ${MEM_USED} of ${MEM_TOTAL}, Available: ${MEM_AVAIL})"
+    check_security "Memory Usage" "PASS" "Healthy memory usage (${MEM_USAGE}% used - Used: ${USED_MEM} of ${TOTAL_MEM}, Available: ${FREE_MEM})"
 elif [ "$MEM_USAGE" -lt 80 ]; then
-    check_security "Memory Usage" "WARN" "Moderate memory usage (${MEM_USAGE}% used - Used: ${MEM_USED} of ${MEM_TOTAL}, Available: ${MEM_AVAIL})"
+    check_security "Memory Usage" "WARN" "Moderate memory usage (${MEM_USAGE}% used - Used: ${USED_MEM} of ${TOTAL_MEM}, Available: ${FREE_MEM})"
 else
-    check_security "Memory Usage" "FAIL" "Critical memory usage (${MEM_USAGE}% used - Used: ${MEM_USED} of ${MEM_TOTAL}, Available: ${MEM_AVAIL})"
+    check_security "Memory Usage" "FAIL" "Critical memory usage (${MEM_USAGE}% used - Used: ${USED_MEM} of ${TOTAL_MEM}, Available: ${FREE_MEM})"
 fi
 
 # Check CPU usage
-CPU_CORES=$(nproc)
 CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{print int($2)}')
 CPU_IDLE=$(top -bn1 | grep "Cpu(s)" | awk '{print int($8)}')
 CPU_LOAD=$(uptime | awk -F'load average:' '{ print $2 }' | awk -F',' '{ print $1 }' | tr -d ' ')
@@ -381,19 +366,53 @@ else
     check_security "Password Policy" "FAIL" "No password policy configured - system accepts weak passwords"
 fi
 
-# Check for suspicious SUID files
-COMMON_SUID_PATHS='^/usr/bin/|^/bin/|^/sbin/|^/usr/sbin/|^/usr/lib|^/usr/libexec'
-KNOWN_SUID_BINS='ping$|sudo$|mount$|umount$|su$|passwd$|chsh$|newgrp$|gpasswd$|chfn$'
+# check for sudo users
+SUDO_USERS=$(grep -Po '^sudo.+:\K.*$' /etc/group)
 
-SUID_FILES=$(find / -type f -perm -4000 2>/dev/null | \
-    grep -v -E "$COMMON_SUID_PATHS" | \
-    grep -v -E "$KNOWN_SUID_BINS" | \
-    wc -l)
+if [ -z "$SUDO_USERS" ]; then
+    check_security "Sudo Users" "FAIL" "No users in the sudo group - no users with root access"
+else
+    check_security "Sudo Users" "PASS" "Sudo group members: $SUDO_USERS"
+fi
 
-if [ "$SUID_FILES" -eq 0 ]; then
+# Check for ssh keys in authorized_keys
+for user in $SUDO_USERS; do
+    AUTH_KEYS="/home/$user/.ssh/authorized_keys"
+    if [ -f "$AUTH_KEYS" ]; then
+        SSH_KEYS=$(wc -l "$AUTH_KEYS" | awk '{print $1}')
+        if [ "$SSH_KEYS" -gt 0 ]; then
+            check_security "SSH Keys" "PASS" "Found $SSH_KEYS SSH keys in for user $user"
+        else
+            check_security "SSH Keys" "WARN" "No SSH keys found for user $user - consider using key-based authentication"
+        fi
+    else
+        check_security "SSH Keys" "WARN" "No SSH keys found for user $user - consider using key-based authentication"
+    fi
+done
+
+
+# Check for SUID files, and check their md5 checksums against the ones in the dpkg database
+SUID_FILES=$(find / -type f -perm -4000 2>/dev/null)
+SUID_SUSPECT=""
+for file in $SUID_FILES; do
+    FILE_HASH=$(md5sum "$file" | awk '{print $1}')
+    DEB_PKG=$(dpkg -S "$file" 2>/dev/null | cut -d: -f1)
+    if [ -z "$DEB_PKG" ]; then
+        SUID_SUSPECT="$SUID_SUSPECT\n$file"
+    else
+        DEB_HASH=$(cut -f2- -d"/" $file | grep /var/lib/dpkg/info/$DEB_PKG.md5sums | cut -d" " -f1)
+        if [ "$FILE_HASH" != "$DEB_HASH" ]; then
+            SUID_SUSPECT="$SUID_SUSPECT\n$file"
+        fi
+    fi
+done
+
+if [ "$SUID_SUSPECT" = "" ]; then
     check_security "SUID Files" "PASS" "No suspicious SUID files found - good security practice"
 else
-    check_security "SUID Files" "WARN" "Found $SUID_FILES SUID files outside standard locations - verify if legitimate"
+    for file in $SUID_SUSPECT; do
+        check_security "SUID Files" "WARN" "Found suspect SUID: $file"
+    done
 fi
 
 # Add system information summary to report
