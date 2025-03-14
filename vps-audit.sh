@@ -27,12 +27,6 @@ print_info() {
     echo "$label: $value" >> "$REPORT_FILE"
 }
 
-# Ensure script is run as root
-if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}Please run as root${NC}"
-    exit 1
-fi
-
 # Function to check command existence
 command_exists() {
     command -v "$1" >/dev/null 2>&1
@@ -57,12 +51,11 @@ KERNEL_VERSION=$(uname -r)
 HOSTNAME=$HOSTNAME
 UPTIME=$(uptime -p)
 UPTIME_SINCE=$(uptime -s)
-
-read -r -d ":" CPU_CORES CPU_INFO <<< "$(grep "^model name" /proc/cpuinfo | uniq -c | sed -r -e 's/^ +//' -e 's/ model name\t: +/:/')"
-read -r -d " " TOTAL_MEM USED_MEM FREE_MEM <<< "$(free -h | awk '/^Mem:/ {print $2" "$3" "$7}')"
-read -r -d " " TOTAL_DISK USED_DISK FREE_DISK <<< "$(df -h / | awk 'NR==2 {print $2" "$3" "$4}')"
-read -r -d " " PUBLIC_IFACE PUBLIC_IP <<< "$(ip route get 1 | grep -o "dev.*" | awk '{print $2" "$4}')"
-read -r -d " " LOAD_AVG1 LOAD_AVG5 LOAD_AVG15 <<< "$(cat /proc/loadavg)"
+IFS=: read CPU_CORES CPU_INFO <<< "$(grep "^model name" /proc/cpuinfo | uniq -c | sed -r -e 's/^ +//' -e 's/ model name\t: +/:/')"
+read TOTAL_MEM USED_MEM FREE_MEM <<< "$(free --giga | awk '/^Mem:/ {print $2" "$3" "$7}')"
+read TOTAL_DISK USED_DISK FREE_DISK <<< "$(df -BG / | sed 's/G//g' | awk 'NR==2 {print $2" "$3" "$4}')"
+read PUBLIC_IFACE PUBLIC_IP <<< "$(ip route get 1 | grep -o "dev.*" | awk '{print $2" "$4}')"
+read LOAD_AVG1 LOAD_AVG5 LOAD_AVG15 <<< "$(cut -f1-3 -d " " /proc/loadavg)"
 
 # Print system information
 print_info "Hostname" "$HOSTNAME"
@@ -71,17 +64,17 @@ print_info "Kernel Version" "$KERNEL_VERSION"
 print_info "Uptime" "$UPTIME (since $UPTIME_SINCE)"
 print_info "CPU Model" "$CPU_INFO"
 print_info "CPU Cores" "$CPU_CORES"
-print_info "Memory" Total: "$TOTAL_MEM" Used: "$USED_MEM" Free: "$FREE_MEM"
-print_info "Disk Space" "Total: $TOTAL_DISK, Used: $USED_DISK, Free: $FREE_DISK"
+print_info "Memory" "Total: ${TOTAL_MEM}G Used: ${USED_MEM}G Free: ${FREE_MEM}G"
+print_info "Disk Space" "Total: ${TOTAL_DISK}G, Used: ${USED_DISK}G, Free: ${FREE_DISK}G"
 print_info "Public IP" "$PUBLIC_IP"/"$PUBLIC_IFACE"
-print_info "Load Average" "$LOAD_AVG1" "$LOAD_AVG5" "$LOAD_AVG15"
+print_info "Load Average" "$LOAD_AVG1 $LOAD_AVG5 $LOAD_AVG15"
 
 echo "" >> "$REPORT_FILE"
 
 # Security Audit Section
 print_header "Security Audit Results"
 
-# Function to check and report with three states
+# Function to check and report with four states
 check_security() {
     local test_name="$1"
     local status="$2"
@@ -99,6 +92,10 @@ check_security() {
         "FAIL")
             echo -e "${RED}[FAIL]${NC} $test_name ${GRAY}- $message${NC}"
             echo "[FAIL] $test_name - $message" >> "$REPORT_FILE"
+            ;;
+        "INFO")
+            echo -e "${BLUE}[INFO]${NC} $test_name ${GRAY}- $message${NC}"
+            echo "[INFO] $test_name - $message" >> "$REPORT_FILE"
             ;;
     esac
     echo "" >> "$REPORT_FILE"
@@ -121,7 +118,7 @@ else
 fi
 
 while IFS= read -r line; do
-    if [[ "$line" =~ ^ *Include ]]; then
+    if [[ "$line" =~ "^ *Include" ]]; then
         INCLUDE=$(echo $line | awk '{print $2}')
         SSHD_CONFIG="$SSHD_CONFIG### Included from $INCLUDE\n"
         if [ -f "$INCLUDE" ]; then
@@ -139,8 +136,8 @@ while IFS= read -r line; do
     fi
     done <<< "$(grep -v -e "^ *#" -e "^$" /etc/ssh/sshd_config)"
 # function to check on SSH configuration values
-sshd_config() {   
-    return $(grep "^ *$1" 2>/dev/null | head -1 | awk '{print $2}') <<< "$SSHD_CONFIG"
+sshd_config() { 
+    echo "$SSHD_CONFIG" | grep -e "^ *$1" 2>/dev/null | head -1 | awk '{print $2}'
 }
 
 # Check SSH root login (handle both main config and overrides if they exist)
@@ -161,7 +158,7 @@ fi
 
 
 # Check for default/unsecure SSH ports 
-UNPRIVILEGED_PORT_START=$(sysctl -n net.ipv4.ip_unprivileged_port_start)
+UNPRIVILEGED_PORT_START=$(cat /proc/sys/net/ipv4/ip_unprivileged_port_start)
 SSH_PORT=$(sshd_config "Port")
 if [ -z "$SSH_PORT" ]; then
     SSH_PORT="22"
@@ -177,32 +174,36 @@ fi
 
 # Check Firewall Status
 check_firewall_status() {
-    if command_exists ufw; then
-        if ufw status | grep -qw "active"; then
-            check_security "Firewall Status (UFW)" "PASS" "UFW firewall is active and protecting your system"
-        else
-            check_security "Firewall Status (UFW)" "FAIL" "UFW firewall is not active - your system is exposed to network attacks"
-        fi
-    elif command_exists firewall-cmd; then
-        if firewall-cmd --state 2>/dev/null | grep -q "running"; then
-            check_security "Firewall Status (firewalld)" "PASS" "Firewalld is active and protecting your system"
-        else
-            check_security "Firewall Status (firewalld)" "FAIL" "Firewalld is not active - your system is exposed to network attacks"
-        fi
-    elif command_exists iptables; then
-        if iptables -L -n | grep -q "Chain INPUT"; then
-            check_security "Firewall Status (iptables)" "PASS" "iptables rules are active and protecting your system"
-        else
-            check_security "Firewall Status (iptables)" "FAIL" "No active iptables rules found - your system may be exposed"
-        fi
-    elif command_exists nft; then
-        if nft list ruleset | grep -q "table"; then
-            check_security "Firewall Status (nftables)" "PASS" "nftables rules are active and protecting your system"
-        else
-            check_security "Firewall Status (nftables)" "FAIL" "No active nftables rules found - your system may be exposed"
-        fi
+    if [ "$EUID" -ne 0 ]; then
+        check_security "Firewall Status" "INFO" "Script is not running as root - some checks may be skipped"
     else
-        check_security "Firewall Status" "FAIL" "No recognized firewall tool is installed on this system"
+        if command_exists ufw; then
+            if ufw status | grep -qw "active"; then
+                check_security "Firewall Status (UFW)" "PASS" "UFW firewall is active and protecting your system"
+            else
+                check_security "Firewall Status (UFW)" "FAIL" "UFW firewall is not active - your system is exposed to network attacks"
+            fi
+        elif command_exists firewall-cmd; then
+            if firewall-cmd --state 2>/dev/null | grep -q "running"; then
+                check_security "Firewall Status (firewalld)" "PASS" "Firewalld is active and protecting your system"
+            else
+                check_security "Firewall Status (firewalld)" "FAIL" "Firewalld is not active - your system is exposed to network attacks"
+            fi
+        elif command_exists iptables; then
+            if iptables -L -n | grep -q "Chain INPUT"; then
+                check_security "Firewall Status (iptables)" "PASS" "iptables rules are active and protecting your system"
+            else
+                check_security "Firewall Status (iptables)" "FAIL" "No active iptables rules found - your system may be exposed"
+            fi
+        elif command_exists nft; then
+            if nft list ruleset | grep -q "table"; then
+                check_security "Firewall Status (nftables)" "PASS" "nftables rules are active and protecting your system"
+            else
+                check_security "Firewall Status (nftables)" "FAIL" "No active nftables rules found - your system may be exposed"
+            fi
+        else
+            check_security "Firewall Status" "FAIL" "No recognized firewall tool is installed on this system"
+        fi
     fi
 }
 
@@ -219,21 +220,21 @@ fi
 # Check Intrusion Prevention Systems (Fail2ban or CrowdSec)
 IPS_INSTALLED=0
 IPS_ACTIVE=0
-
-
-dpkg -l fail2ban && {
+dpkg-query -l fail2ban >/dev/null 2>&1 && {
     IPS_INSTALLED=1
+    FAIL2BAN_INSTALLED=1
     systemctl is-active fail2ban >/dev/null 2>&1 && IPS_ACTIVE=1
 }
 
-dpkg -l crowdsec && {
+dpkg-query -l crowdsec >/dev/null 2>&1 && {
     IPS_INSTALLED=1
+    CROWDSEC_INSTALLED=1
     systemctl is-active crowdsec >/dev/null 2>&1 && IPS_ACTIVE=1
 }
 
-dpkg -l fail2ban >/dev/null || dpkg -l crowdsec >/dev/null || {
+if [ -z "$FAIL2BAN_INSTALLED" ] && [ -z "$CROWDSEC_INSTALLED" ]; then
     check_security "Intrusion Prevention" "FAIL" "No intrusion prevention system (Fail2ban or CrowdSec) is installed"
-}
+fi
 
 case "$IPS_INSTALLED$IPS_ACTIVE" in
     "11") check_security "Intrusion Prevention" "PASS" "Fail2ban or CrowdSec is installed and running" ;;
@@ -268,11 +269,12 @@ UPDATES=$(apt-get -s upgrade 2>/dev/null | grep -P '^\d+ upgraded' | cut -d" " -
 if [ -z "$UPDATES" ]; then
     UPDATES=0
 fi
-if [ "$UPDATES" -eq 0]; then
+if [ "$UPDATES" -eq 0 ]; then
     check_security "System Updates" "PASS" "All system packages are up to date"
 else
     check_security "System Updates" "FAIL" "$UPDATES security updates available - system is vulnerable to known exploits"
 fi
+
 # Check running services
 SERVICES=$(systemctl list-units --type=service --state=running | grep -c "loaded active running")
 if [ "$SERVICES" -lt 20 ]; then
@@ -317,7 +319,7 @@ format_for_report() {
 }
 
 # Check disk space usage
-DISK_USAGE=$((USED_DISK / TOTAL_DISK * 100))
+DISK_USAGE=$(( $USED_DISK  * 100 /  $TOTAL_DISK))
 if [ "$DISK_USAGE" -lt 50 ]; then
     check_security "Disk Usage" "PASS" "Healthy disk space available (${DISK_USAGE}% used - Used: ${USED_DISK} of ${TOTAL_DISK}, Available: ${FREE_DISK})"
 elif [ "$DISK_USAGE" -lt 80 ]; then
@@ -327,7 +329,7 @@ else
 fi
 
 # Check memory usage
-MEM_USAGE=$((USED_MEM / TOTAL_MEM * 100))
+MEM_USAGE=$(( $USED_MEM  * 100 /  $TOTAL_MEM))
 if [ "$MEM_USAGE" -lt 50 ]; then
     check_security "Memory Usage" "PASS" "Healthy memory usage (${MEM_USAGE}% used - Used: ${USED_MEM} of ${TOTAL_MEM}, Available: ${FREE_MEM})"
 elif [ "$MEM_USAGE" -lt 80 ]; then
@@ -348,11 +350,16 @@ else
     check_security "CPU Usage" "FAIL" "Critical CPU usage (${CPU_USAGE}% used - Active: ${CPU_USAGE}%, Idle: ${CPU_IDLE}%, Load: ${CPU_LOAD}, Cores: ${CPU_CORES})"
 fi
 
-# Check sudo configuration
-if grep -q "^Defaults.*logfile" /etc/sudoers; then
-    check_security "Sudo Logging" "PASS" "Sudo commands are being logged for audit purposes"
+# # Check sudo configuration - if we're root that is
+if [ "$EUID" -ne 0 ]; then
+    check_security "Sudo Users" "INFO" "Script is not running as root - some checks may be skipped"
 else
-    check_security "Sudo Logging" "FAIL" "Sudo commands are not being logged - reduces audit capability"
+    
+    if grep -q "^Defaults.*logfile" /etc/sudoers; then
+        check_security "Sudo Logging" "PASS" "Sudo commands are being logged for audit purposes"
+    else
+        check_security "Sudo Logging" "FAIL" "Sudo commands are not being logged - reduces audit capability"
+    fi
 fi
 
 # Check password policy
@@ -365,6 +372,7 @@ if [ -f "/etc/security/pwquality.conf" ]; then
 else
     check_security "Password Policy" "FAIL" "No password policy configured - system accepts weak passwords"
 fi
+
 
 # check for sudo users
 SUDO_USERS=$(grep -Po '^sudo.+:\K.*$' /etc/group)
@@ -390,18 +398,34 @@ for user in $SUDO_USERS; do
     fi
 done
 
-
 # Check for SUID files, and check their md5 checksums against the ones in the dpkg database
-SUID_FILES=$(find / -type f -perm -4000 2>/dev/null)
+SUID_FILES=$(find / -type f -perm -4000 -xdev 2>/dev/null)
 SUID_SUSPECT=""
 for file in $SUID_FILES; do
     FILE_HASH=$(md5sum "$file" | awk '{print $1}')
     DEB_PKG=$(dpkg -S "$file" 2>/dev/null | cut -d: -f1)
     if [ -z "$DEB_PKG" ]; then
+        if [[ "$file" == /usr/* ]]; then
+            BIN_FILE=$(echo $file | sed 's/^\/usr//')
+            if [ -f "$BIN_FILE" ]; then
+		file_inode=$(ls -i $file | cut -f1 -d " ")
+		binfile_inode=$(ls -i $BIN_FILE | cut -f1 -d " ")
+		if [[ "$file_inode" == "$binfile_inode" ]]; then
+                    check_security "SUID Files" "INFO" "Couldn't find $file in installed packages, checking hardlinked $BIN_FILE"
+                    DEB_PKG=$(dpkg -S "$BIN_FILE" 2>/dev/null | cut -d: -f1)
+                    file=$BIN_FILE
+		fi
+            fi
+        fi
+    fi
+    if [ -z "$DEB_PKG" ]; then
+        check_security "SUID Files" "WARN" "Found SUID binary not in installed packages: $file"
         SUID_SUSPECT="$SUID_SUSPECT\n$file"
     else
-        DEB_HASH=$(cut -f2- -d"/" $file | grep /var/lib/dpkg/info/$DEB_PKG.md5sums | cut -d" " -f1)
+        DEB_MATCH=$(echo $file | cut -c2-)
+        DEB_HASH=$(grep -e ${DEB_MATCH}$ /var/lib/dpkg/info/$DEB_PKG.md5sums | cut -d" " -f1)
         if [ "$FILE_HASH" != "$DEB_HASH" ]; then
+            check_security "SUID Files" "FAIL" "Found SUID binary with mismatched checksum: $file"
             SUID_SUSPECT="$SUID_SUSPECT\n$file"
         fi
     fi
@@ -409,10 +433,6 @@ done
 
 if [ "$SUID_SUSPECT" = "" ]; then
     check_security "SUID Files" "PASS" "No suspicious SUID files found - good security practice"
-else
-    for file in $SUID_SUSPECT; do
-        check_security "SUID Files" "WARN" "Found suspect SUID: $file"
-    done
 fi
 
 # Add system information summary to report
