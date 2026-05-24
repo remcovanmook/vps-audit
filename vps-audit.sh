@@ -588,11 +588,11 @@ if [ -f /proc/stat ]; then
     sleep 0.5
 
     read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
-    idle=$((idle + iowait))
-    total=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    new_idle=$((idle + iowait))
+    new_total=$((user + nice + system + idle + iowait + irq + softirq + steal))
 
-    diff_idle=$((idle - prev_idle))
-    diff_total=$((total - prev_total))
+    diff_idle=$((new_idle - prev_idle))
+    diff_total=$((new_total - prev_total))
 
     if [ "$diff_total" -gt 0 ]; then
         CPU_USAGE=$(( (diff_total - diff_idle) * 100 / diff_total ))
