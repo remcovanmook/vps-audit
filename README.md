@@ -9,35 +9,38 @@ A comprehensive Bash script for auditing the security and performance of your VP
 
 ### Security Checks
 
-- SSH Configuration
-  - Root login status
-  - Password authentication
-  - Non-default port usage
-- Firewall Status (UFW)
-- Fail2ban Configuration
-- Failed Login Attempts
-- System Updates Status
-- Running Services Analysis
-- Open Ports Detection
-- Sudo Logging Configuration
-- Password Policy Enforcement
-- SUID Files Detection
+- **SSH Configuration:**
+  - Root login status (using active config via `sshd -T`)
+  - Password authentication status
+  - Agent and X11 forwarding permissions
+  - Non-default and unprivileged port usage
+- **Firewall Status:** Detection and active status check for UFW, Firewalld, iptables, and nftables
+- **Intrusion Prevention:** Status checks for active Fail2ban or CrowdSec installations
+- **Failed Login Attempts:** Auditing `/var/log/auth.log` or `/var/log/secure`
+- **System Updates Status:** Pending security updates count
+- **Running Services Analysis:** Total count of active systemd/rc services
+- **Open Ports Detection:** Checks listening sockets via `ss` (preferred) or `netstat`
+- **Sudo Logging Configuration:** Audits `/etc/sudoers` and `/etc/sudoers.d/*`
+- **Password Policy Enforcement:** Verifies pwquality configuration `/etc/security/pwquality.conf`
+- **User Database Integrity:** Scans for accounts with empty passwords in `/etc/shadow` and audits for duplicate UID 0 accounts in `/etc/passwd`
+- **SUID Files Detection:** Checks for suspicious SUID files, verifying MD5 checksums against the system package database (excluding active container directories)
+- **Kernel Security & Modules:** Audits kernel taint logs, post-boot runtime module loading disablement, and forced module signature verification
 
-### Performance Monitoring
+### System Information & Performance
 
+- Multi-distribution OS detection (Debian/Ubuntu, RHEL/CentOS/Fedora, and Alpine Linux)
+- ARM/AArch64 heterogeneous processor detection (listing big.LITTLE core models e.g., Cortex-A53/A72)
 - Disk Space Usage
-- Memory Usage
-- CPU Usage
-- Active Internet Connections
+- Memory Usage (reported in Megabytes to support low-spec VPS hosts)
+- CPU Usage (utilizing high-precision `/proc/stat` and `/proc/loadavg` metrics)
+- Active Container Runtimes detection (LXC, LXD, Docker, containerd, Podman)
 
 ## Requirements
 
-- Ubuntu/Debian-based Linux system
+- Linux operating system (Debian, Ubuntu, CentOS, RHEL, Fedora, or Alpine Linux)
 - Root access or sudo privileges
-- Basic packages (most are pre-installed):
-  - ufw
-  - systemd
-  - netstat
+- Standard system packages (most are pre-installed):
+  - ss (preferred) or netstat
   - grep
   - awk
 
@@ -62,8 +65,12 @@ chmod +x vps-audit.sh
 Run the script with sudo privileges:
 
 ```bash
-sudo ./vps-audit.sh
+sudo ./vps-audit.sh [options]
 ```
+
+### Options
+- `-v`, `--verbose`: Outputs additional details identifying the exact files and specific tests associated with any `WARN` or `FAIL` check results, grouped by file path.
+- `-h`, `--help`: Prints command usage guidelines.
 
 The script will:
 
@@ -72,7 +79,9 @@ The script will:
    - 🟢 [PASS] - Check passed successfully
    - 🟡 [WARN] - Potential issues detected
    - 🔴 [FAIL] - Critical issues found
-3. Generate a detailed report file: `vps-audit-report-[TIMESTAMP].txt`
+3. Generate a detailed report file: 
+   - When run as root: `/var/log/vps-audit/vps-audit-report-[TIMESTAMP].txt`
+   - When run as non-root: `./vps-audit-report-[TIMESTAMP].txt`
 
 ## Output Format
 
@@ -134,10 +143,9 @@ You can modify the thresholds by editing the following variables in the script:
 
 ## Limitations
 
-- Designed for Debian/Ubuntu-based systems
-- Requires root/sudo access
-- Some checks may need customization for specific environments
-- Not a replacement for professional security audit
+- Supports Debian/Ubuntu, RHEL/CentOS/Fedora, and Alpine Linux distributions
+- Requires root/sudo access for full system database and shadow/module checks
+- Not a replacement for a professional security audit
 
 ## Contributing
 
